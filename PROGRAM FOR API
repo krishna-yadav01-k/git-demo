@@ -1,0 +1,10 @@
+import requests
+str=input("enter the name (AUTOMATIC TELLER gender ):")
+url="https://api.genderize.io/?name="+str
+response =requests.get(url)
+if response.status_code==200:
+    data=response.json()
+    print("name:",data["name"])
+    print("gender:",data["gender"])
+else:
+    print("errror")
