@@ -1,0 +1,207 @@
+
+!pip install pke sense2vec flashtext
+
+!pip install git+https://github.com/boudinfl/pke.git
+!pip install git+https://github.com/boudinfl/pke.git
+!git clone https://github.com/QuestgenAI/Questgen.ai.git
+!ls Questgen.ai/Questgen  # Check if there's a subdirectory like 'Questgen'
+# Install required packages
+!pip install pke sense2vec flashtext
+
+!git clone https://github.com/ramsrigouthamg/Questgen.ai.git
+
+
+%cd Questgen.ai
+
+# Install the dependencies specified in the requirements.txt (if any)
+!pip install -r requirements.txt
+
+
+import numpy as np
+import torch
+from transformers import T5ForConditionalGeneration, T5Tokenizer
+import spacy
+import time
+from sense2vec import Sense2Vec
+import nltk
+from nltk.corpus import brown
+from nltk import FreqDist
+from flashtext import KeywordProcessor
+import string
+import pke  # Now it should work after installing it
+from Questgen.encoding.encoding import beam_search_decoding
+from Questgen.mcq.mcq import tokenize_sentences, get_keywords, get_sentences_for_keyword, generate_questions_mcq, generate_normal_questions
+
+nltk.download('brown', quiet=True, force=True)
+nltk.download('stopwords', quiet=True, force=True)
+nltk.download('popular', quiet=True, force=True)
+from nltk.corpus import stopwords
+
+# NormalizedLevenshtein class
+class NormalizedLevenshtein:
+    def distance(self, str1, str2):
+        """
+        Compute the Levenshtein distance between two strings.
+        """
+        n, m = len(str1), len(str2)
+        d = np.zeros((n+1, m+1))
+        
+        for i in range(n+1):
+            d[i, 0] = i
+        for j in range(m+1):
+            d[0, j] = j
+            
+        for i in range(1, n+1):
+            for j in range(1, m+1):
+                cost = 0 if str1[i-1] == str2[j-1] else 1
+                d[i, j] = min(d[i-1, j] + 1,  # deletion
+                              d[i, j-1] + 1,  # insertion
+                              d[i-1, j-1] + cost)  # substitution
+                
+        return d[n, m]
+    
+    def normalized_distance(self, str1, str2):
+        """
+        Compute the normalized Levenshtein distance.
+        """
+        max_len = max(len(str1), len(str2))
+        if max_len == 0:
+            return 0
+        return self.distance(str1, str2) / max_len
+
+
+# QGen class for generating MCQ and short questions
+class QGen:
+    def init(self):
+        self.tokenizer = T5Tokenizer.from_pretrained('t5-large')  # Use 't5-large' model or any other model of choice
+        model = T5ForConditionalGeneration.from_pretrained('t5-large')  # Use Hugging Face models
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model.to(self.device)
+        self.model = model
+        self.nlp = spacy.load('en_core_web_sm', quiet=True)
+        self.s2v = Sense2Vec().from_disk('s2v_old')  # Ensure 's2v_old' is available or load a compatible version
+        self.fdist = FreqDist(brown.words())
+        self.normalized_levenshtein = NormalizedLevenshtein()
+        self.set_seed(42)
+
+    def set_seed(self, seed):
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+
+    def predict_mcq(self, payload):
+        start = time.time()
+        inp = {
+            "input_text": payload.get("input_text"),
+            "max_questions": payload.get("max_questions", 4)
+        }
+
+        text = inp['input_text']
+        sentences = tokenize_sentences(text)
+        joiner = " "
+        modified_text = joiner.join(sentences)
+
+        keywords = get_keywords(self.nlp, modified_text, inp['max_questions'], self.s2v, self.fdist, self.normalized_levenshtein, len(sentences))
+
+        keyword_sentence_mapping = get_sentences_for_keyword(keywords, sentences)
+
+        for k in keyword_sentence_mapping.keys():
+            text_snippet = " ".join(keyword_sentence_mapping[k][:3])
+            keyword_sentence_mapping[k] = text_snippet
+
+        final_output = {}
+
+        if len(keyword_sentence_mapping.keys()) == 0:
+            return final_output
+        else:
+            try:
+                generated_questions = generate_questions_mcq(keyword_sentence_mapping, self.device, self.tokenizer, self.model, self.s2v, self.normalized_levenshtein)
+            except Exception as e:
+                return final_output
+            end = time.time()
+
+            final_output["statement"] = modified_text
+            final_output["questions"] = generated_questions["questions"]
+            final_output["time_taken"] = end - start
+
+            if self.device == 'cuda':
+                torch.cuda.empty_cache()
+
+            return final_output
+
+    def predict_shortq(self, payload):
+        inp = {
+            "input_text": payload.get("input_text"),
+            "max_questions": payload.get("max_questions", 4)
+        }
+
+        text = inp['input_text']
+        sentences = tokenize_sentences(text)
+        joiner = " "
+        modified_text = joiner.join(sentences)
+
+        keywords = get_keywords(self.nlp, modified_text, inp['max_questions'], self.s2v, self.fdist, self.normalized_levenshtein, len(sentences))
+
+        keyword_sentence_mapping = get_sentences_for_keyword(keywords, sentences)
+
+        for k in keyword_sentence_mapping.keys():
+            text_snippet = " ".join(keyword_sentence_mapping[k][:3])
+            keyword_sentence_mapping[k] = text_snippet
+
+        final_output = {}
+
+        if len(keyword_sentence_mapping.keys()) == 0:
+            return final_output
+        else:
+            generated_questions = generate_normal_questions(keyword_sentence_mapping, self.device, self.tokenizer, self.model)
+
+        final_output["statement"] = modified_text
+        final_output["questions"] = generated_questions["questions"]
+
+        if self.device == 'cuda':
+            torch.cuda.empty_cache()
+
+        return final_output
+
+    def paraphrase(self, payload):
+        start = time.time()
+        inp = {
+            "input_text": payload.get("input_text"),
+            "max_questions": payload.get("max_questions", 3)
+        }
+
+        text = inp['input_text']
+        num = inp['max_questions']
+
+        self.sentence = text
+        self.text = "paraphrase: " + self.sentence + " </s>"
+
+        encoding = self.tokenizer.encode_plus(self.text, pad_to_max_length=True, return_tensors="pt")
+        input_ids, attention_masks = encoding["input_ids"].to(self.device), encoding["attention_mask"].to(self.device)
+
+        beam_outputs = self.model.generate(
+            input_ids=input_ids,
+            attention_mask=attention_masks,
+            max_length=50,
+            num_beams=50,
+            num_return_sequences=num,
+            no_repeat_ngram_size=2,
+            early_stopping=True
+        )
+
+        final_outputs = []
+        for beam_output in beam_outputs:
+            sent = self.tokenizer.decode(beam_output, skip_special_tokens=True, clean_up_tokenization_spaces=True)
+            if sent.lower() != self.sentence.lower() and sent not in final_outputs:
+                final_outputs.append(sent)
+
+        output = {}
+        output['Question'] = text
+        output['Count'] = num
+        output['Paraphrased Questions'] = final_outputs
+
+        if self.device == 'cuda':
+            torch.cuda.empty_cache()
+
+        return output

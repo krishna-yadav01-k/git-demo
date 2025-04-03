@@ -1,0 +1,163 @@
+# Install required libraries
+!pip install spacy transformers PyPDF2 pdfplumber nltk pytesseract Pillow PyMuPDF
+
+# Install Tesseract-OCR engine for OCR functionality
+!apt-get update
+!apt-get install -y tesseract-ocr
+
+# Import necessary libraries
+import spacy
+from transformers import pipeline
+import pdfplumber
+import nltk
+import mimetypes
+from PIL import Image
+import pytesseract
+from PyPDF2 import PdfReader
+from google.colab import files
+
+# Download necessary NLTK data
+nltk.download('punkt')
+
+# Load SpaCy model
+nlp = spacy.load("en_core_web_sm")
+
+# Load the Question Generation model from HuggingFace using the correct task
+question_generator = pipeline("text2text-generation", model="valhalla/t5-base-qa-qg-hl")
+
+# Function to extract text from a PDF file
+def extract_text_from_pdf(pdf_path):
+    text = ""
+    with pdfplumber.open(pdf_path) as pdf:
+        for page in pdf.pages:
+            text += page.extract_text()
+    return text
+
+# Function to extract named entities from the text
+def extract_named_entities(text):
+    doc = nlp(text)
+    named_entities = [(entity.text, entity.label_) for entity in doc.ents]
+    return named_entities
+
+# Function to generate questions from the text using the question generator
+def generate_questions_from_text(text):
+    # Input formatting for the model
+    formatted_input = "generate questions: " + text
+    # Adjusting parameters to generate more diverse questions (using sampling instead of greedy search)
+    questions = question_generator(formatted_input, num_return_sequences=15, num_beams=1, do_sample=True, temperature=1.0, top_k=50)
+    return [q['generated_text'] for q in questions]
+
+# Function to filter out duplicate questions
+def filter_duplicates(questions):
+    return list(set(questions))
+
+# Function to detect file type
+def detect_file_type(file_path):
+    # Get MIME type
+    mime_type, _ = mimetypes.guess_type(file_path)
+
+    # Check if it's a text file
+    if mime_type == 'text/plain':
+        return 'Text file'
+    
+    # If it's a PDF file, we need to check its content
+    elif mime_type == 'application/pdf':
+        return check_pdf(file_path)
+
+    # If it's an image file (JPG, PNG, etc.), check if it is a scanned image
+    elif mime_type in ['image/jpeg', 'image/png', 'image/tiff']:
+        return check_image(file_path)
+    
+    return 'Unknown type'
+
+# Function to check if the PDF contains text or scanned images
+def check_pdf(file_path):
+    # Read the PDF and check for text
+    reader = PdfReader(file_path)
+    text = ""
+    for page in reader.pages:
+        text += page.extract_text() or ''
+    
+    if text.strip():  # PDF has readable text
+        return 'Text PDF', text
+    else:  # PDF is most likely a scanned document (image-based)
+        return 'Scanned PDF', None
+
+# Function to check if the image contains text using OCR (Optical Character Recognition)
+def check_image(file_path):
+    try:
+        img = Image.open(file_path)
+        text = pytesseract.image_to_string(img)
+
+        if text.strip():  # Image has readable text
+            return 'Scanned image with text', text
+        else:
+            return 'Image without text', None
+    except Exception as e:
+        return f"Error processing image: {e}", None
+
+# Function to get user input either through typing or by uploading a file
+def get_input():
+    print("Enter '1' to input text manually, or '2' to upload a file (PDF or Image): ")
+    choice = input()
+
+    if choice == '1':
+        print("Please enter your text:")
+        text = input()
+        return text, "Manual text"
+    
+    elif choice == '2':
+        uploaded = files.upload()
+        file_name = list(uploaded.keys())[0]
+        file_type, text = detect_file_type(file_name)
+        
+        print(f"Detected file type: {file_type}")
+        
+        if file_type == 'Text file':
+            with open(file_name, 'r') as f:
+                text = f.read()
+        elif file_type == 'Text PDF':
+            text = extract_text_from_pdf(file_name)
+        elif file_type == 'Scanned PDF' or file_type == 'Scanned image with text':
+            # OCR for scanned PDFs or images
+            if file_type == 'Scanned PDF':
+                text = extract_text_from_pdf(file_name)  # OCR applied to scanned PDFs
+            elif file_type == 'Scanned image with text':
+                text = pytesseract.image_to_string(Image.open(file_name))
+        else:
+            print(f"Unsupported file type: {file_type}")
+            return None, None
+        return text, file_type
+
+    else:
+        print("Invalid choice, please enter 1 or 2.")
+        return None, None
+
+# Main function to run the program
+def main():
+    # Get the input from user
+    text, file_info = get_input()
+
+    if text is None:
+        return
+
+    print(f"\nFile Information: {file_info}")
+    
+    # Extract named entities
+    named_entities = extract_named_entities(text)
+    print("\nExtracted Named Entities:", named_entities)
+
+    # Generate questions from the input text
+    questions = generate_questions_from_text(text)
+
+    # Filter out duplicate questions
+    filtered_questions = filter_duplicates(questions)
+
+    # Print the generated questions
+    print("\nGenerated Questions:")
+    for question in filtered_questions:
+        print(question)
+
+# Run the program
+if __name__ == "__main__":
+    main()

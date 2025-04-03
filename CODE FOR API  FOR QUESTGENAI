@@ -1,0 +1,153 @@
+from flask import Flask, render_template, request, jsonify
+import fitz  # PyMuPDF
+import faiss
+import numpy as np
+from transformers import pipeline, AutoTokenizer, AutoModel
+import os
+import torch
+
+app = Flask(_name_)
+
+# Load a local language model (Example: Facebook's BART or T5 for QA)
+qa_pipeline = pipeline("text2text-generation", model="google/t5-small-ssm-nq")
+tokenizer = AutoTokenizer.from_pretrained("sentence-transformers/all-MiniLM-L6-v2")
+model = AutoModel.from_pretrained("sentence-transformers/all-MiniLM-L6-v2")
+
+def extract_text_from_pdf(pdf_path):
+    doc = fitz.open(pdf_path)
+    text = ""
+    for page in doc:
+        text += page.get_text("text")
+    return text
+
+def embed_text(texts):
+    inputs = tokenizer(texts, padding=True, truncation=True, return_tensors="pt")
+    with torch.no_grad():
+        embeddings = model(**inputs).last_hidden_state.mean(dim=1)
+    return embeddings.numpy()
+
+def create_vector_store(text):
+    sentences = text.split(". ")  # Simple sentence splitting
+    embeddings = embed_text(sentences)
+    index = faiss.IndexFlatL2(embeddings.shape[1])
+    index.add(embeddings)
+    return index, sentences
+
+def get_answer_from_local_model(vector_store, sentences, user_question):
+    question_embedding = embed_text([user_question])
+    _, indices = vector_store.search(question_embedding, k=3)
+    context = " ".join([sentences[i] for i in indices[0]])
+    response = qa_pipeline(f"question: {user_question} context: {context}")
+    return response[0]["generated_text"]
+
+@app.route('/')
+def home():
+    return render_template("index.html")
+
+@app.route('/upload_pdf', methods=['POST'])
+def upload_pdf():
+    if 'pdf_file' not in request.files:
+        return jsonify({"error": "No file part"})
+    
+    file = request.files['pdf_file']
+    if file.filename == '':
+        return jsonify({"error": "No selected file"})
+    
+    pdf_text = extract_text_from_pdf(file)
+    vector_store, sentences = create_vector_store(pdf_text)
+    
+    # Save the index and sentences for future queries
+    # You can either store these in memory or a database depending on your needs.
+    return jsonify({"status": "File uploaded successfully!"})
+
+@app.route('/ask_question', methods=['POST'])
+def ask_question():
+    question = request.json.get('question')
+    # Here, use the vector store to search for an answer
+    # Assuming you have created the vector store (You need to store these properly)
+    answer = get_answer_from_local_model(vector_store, sentences, question)
+    return jsonify({"answer": answer})
+
+if _name_ == "_main_":
+    app.run(debug=True)
+    
+    
+    
+    # HTML CSS FOR THIS PROGRAM
+    <!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Question Generator</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div class="container">
+        <h1>Question Generator</h1>
+        <input type="file" id="file-upload" class="hidden" onchange="uploadFile()"/>
+        <label for="file-upload" class="upload-label">Upload File</label>
+        <textarea id="text-input" placeholder="Enter or paste your text here..."></textarea>
+        <select id="difficulty">
+            <option value="low">Low</option>
+            <option value="medium" selected>Medium</option>
+            <option value="high">High</option>
+        </select>
+        <button onclick="generateQuestions()">Generate Questions</button>
+        <div id="questions-container">
+            <h2>Generated Questions:</h2>
+            <ul id="questions-list"></ul>
+        </div>
+    </div>
+    <script src="script.js"></script>
+</body>
+</html>
+
+
+#JAVASCRIPT FOR THIS PRG
+let vectorStore = null;
+let sentences = null;
+
+async function uploadFile() {
+    const fileInput = document.getElementById("file-upload");
+    const formData = new FormData();
+    formData.append('pdf_file', fileInput.files[0]);
+
+    try {
+        const response = await fetch('/upload_pdf', {
+            method: 'POST',
+            body: formData
+        });
+        const result = await response.json();
+        if (result.status === "File uploaded successfully!") {
+            alert("File uploaded successfully!");
+        }
+    } catch (error) {
+        console.error("Error uploading file:", error);
+    }
+}
+
+async function generateQuestions() {
+    let questionText = document.getElementById("text-input").value;
+    let difficulty = document.getElementById("difficulty").value;
+    
+    if (!questionText.trim()) {
+        alert("Please enter some text to generate questions.");
+        return;
+    }
+    
+    const response = await fetch('/ask_question', {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ question: questionText })
+    });
+    
+    const result = await response.json();
+    let questionsList = document.getElementById("questions-list");
+    questionsList.innerHTML = "";
+    let li = document.createElement("li");
+    li.textContent = result.answer;
+    questionsList.appendChild(li);
+}
